@@ -129,6 +129,15 @@ jobs:
           echo "MKBOOTIMG=$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py" >> $GITHUB_ENV
           echo "UNPACK_BOOTIMG=$GITHUB_WORKSPACE/mkbootimg/unpack_bootimg.py" >> $GITHUB_ENV
 
+      - name: Download Clang Toolchain (for 6.1 make build)
+        if: ${{ inputs.kernel_version == '6.1' }}
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/toolchains/neutron-clang
+          cd $GITHUB_WORKSPACE/toolchains/neutron-clang
+          echo "Downloading Neutron Clang via antman..."
+          bash <(curl -s "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman") -S
+          echo "CLANG_PATH=$GITHUB_WORKSPACE/toolchains/neutron-clang/bin" >> $GITHUB_ENV
+
       - name: 密钥设置——已经过mkppk修改
         env:
           BOOT_SIGN_KEY: ${{ secrets.BOOT_SIGN_KEY }}
@@ -155,7 +164,7 @@ jobs:
           echo "Using branch for SUSFS: $SUSFS_BRANCH"
 
           # Clone repositories using the branch names
-          git clone https://github.com/WildPlusKernel/AnyKernel3.git -b "$ANYKERNEL_BRANCH"
+          git clone https://${{ secrets.GH_PAT }}@github.com/sleep-bugy/AnyKernel3-SleepX.git -b main AnyKernel3
           git clone https://github.com/ShirkNeko/susfs4ksu.git -b "$SUSFS_BRANCH"
           git clone https://github.com/Tools-cx-app/kernel_patches.git
           # Sukisu的补丁仓库
@@ -177,30 +186,37 @@ jobs:
           mkdir -p "$CONFIG"
           cd "$CONFIG"
 
-          # Initialize and sync kernel source
-          echo "Initializing and syncing kernel source..."
-          FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}"
-          $REPO init --depth=1 --u https://android.googlesource.com/kernel/manifest -b common-${FORMATTED_BRANCH} --repo-rev=v2.16
-          REMOTE_BRANCH=$(git ls-remote https://android.googlesource.com/kernel/common ${FORMATTED_BRANCH})
-          DEFAULT_MANIFEST_PATH=.repo/manifests/default.xml
-          # Check if branch is deprecated
-          if grep -q deprecated <<< $REMOTE_BRANCH; then
-            echo "Found deprecated branch: $FORMATTED_BRANCH"
-            sed -i "s/\"${FORMATTED_BRANCH}\"/\"deprecated\/${FORMATTED_BRANCH}\"/g" $DEFAULT_MANIFEST_PATH
-          fi
-          # Sync repo and apply patches
-          $REPO --version
-          $REPO --trace sync -c -j$(nproc --all) --no-tags --fail-fast
-          echo "REMOTE_BRANCH=$REMOTE_BRANCH" >> $GITHUB_ENV
+          if [ "${{ inputs.kernel_version }}" == "6.1" ]; then
+            # Use custom kernel source for 6.1
+            echo "Using custom kernel source for 6.1..."
+            git clone https://${{ secrets.GH_PAT }}@github.com/sleep-bugy/kernel_sleepx_sm8635.git -b GoogleLTS-6.1.166 --depth 1 common
+            echo "REMOTE_BRANCH=custom-GoogleLTS-6.1.166" >> $GITHUB_ENV
+          else
+            # Initialize and sync kernel source via AOSP manifest
+            echo "Initializing and syncing kernel source..."
+            FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}"
+            $REPO init --depth=1 --u https://android.googlesource.com/kernel/manifest -b common-${FORMATTED_BRANCH} --repo-rev=v2.16
+            REMOTE_BRANCH=$(git ls-remote https://android.googlesource.com/kernel/common ${FORMATTED_BRANCH})
+            DEFAULT_MANIFEST_PATH=.repo/manifests/default.xml
+            # Check if branch is deprecated
+            if grep -q deprecated <<< $REMOTE_BRANCH; then
+              echo "Found deprecated branch: $FORMATTED_BRANCH"
+              sed -i "s/\"${FORMATTED_BRANCH}\"/\"deprecated\/${FORMATTED_BRANCH}\"/g" $DEFAULT_MANIFEST_PATH
+            fi
+            # Sync repo and apply patches
+            $REPO --version
+            $REPO --trace sync -c -j$(nproc --all) --no-tags --fail-fast
+            echo "REMOTE_BRANCH=$REMOTE_BRANCH" >> $GITHUB_ENV
 
-          FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}"
-          if grep -q deprecated <<< "$REMOTE_BRANCH" && \
-             { [ "$FORMATTED_BRANCH" == "android13-5.15" ] && \
-               [ ${{ inputs.sub_level }} -lt 123 ]; }; then
-            echo '修复5.15仅支持旧版C库的BUG'
-            cd ./common
-            curl -LSs https://github.com/zzh20188/GKI_KernelSU_SUSFS/raw/refs/heads/legacy/fix_5.15.legacy -o fix_5.15.legacy.patch
-            patch -p1 < fix_5.15.legacy.patch
+            FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}"
+            if grep -q deprecated <<< "$REMOTE_BRANCH" && \
+               { [ "$FORMATTED_BRANCH" == "android13-5.15" ] && \
+                 [ ${{ inputs.sub_level }} -lt 123 ]; }; then
+              echo '修复5.15仅支持旧版C库的BUG'
+              cd ./common
+              curl -LSs https://github.com/zzh20188/GKI_KernelSU_SUSFS/raw/refs/heads/legacy/fix_5.15.legacy -o fix_5.15.legacy.patch
+              patch -p1 < fix_5.15.legacy.patch
+            fi
           fi
 
       - name: 使GKI在一加8E平台正常使用
@@ -594,28 +610,52 @@ jobs:
       - name: Build with retry
         uses: nick-fields/retry@v3
         with:
-          timeout_minutes: 30
+          timeout_minutes: 60
           max_attempts: 3
           retry_on: timeout
           command: |
             set -e
             set -x
-            cd "$CONFIG"
-            # 替换 BUILD_SYSTEM_DLKM=1 为 BUILD_SYSTEM_DLKM=0
-            sed -i 's/BUILD_SYSTEM_DLKM=1/BUILD_SYSTEM_DLKM=0/' common/build.config.gki.aarch64
+            if [ "${{ inputs.kernel_version }}" == "6.1" ]; then
+              # Custom vendor kernel build using make
+              cd "$CONFIG/common"
+              export PATH="${{ env.CLANG_PATH }}:$PATH"
+              export KBUILD_BUILD_USER="sleepy"
+              export KBUILD_BUILD_HOST="github-actions"
 
-            # 删除 MODULES_ORDER=android/gki_aarch64_modules 行
-            sed -i '/MODULES_ORDER=android\/gki_aarch64_modules/d' common/build.config.gki.aarch64
+              MAKE_ARGS=(
+                O=out
+                ARCH=arm64
+                CC="ccache clang"
+                LLVM=1
+                CROSS_COMPILE=aarch64-linux-gnu-
+                CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+              )
 
-            sed -i '/KMI_SYMBOL_LIST_STRICT_MODE/d' common/build.config.gki.aarch64
+              # Setup defconfig
+              make "${MAKE_ARGS[@]}" peridot_defconfig
 
-            echo "Building the kernel..."
-            if [ -f "build/build.sh" ]; then
-              LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh CC="/usr/bin/ccache clang" || exit 1
+              # Build
+              make -j$(nproc --all) "${MAKE_ARGS[@]}" Image.gz
+              ccache --show-stats
             else
-              tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast --lto=thin //common:kernel_aarch64_dist || exit 1
+              cd "$CONFIG"
+              # 替换 BUILD_SYSTEM_DLKM=1 为 BUILD_SYSTEM_DLKM=0
+              sed -i 's/BUILD_SYSTEM_DLKM=1/BUILD_SYSTEM_DLKM=0/' common/build.config.gki.aarch64
+
+              # 删除 MODULES_ORDER=android/gki_aarch64_modules 行
+              sed -i '/MODULES_ORDER=android\/gki_aarch64_modules/d' common/build.config.gki.aarch64
+
+              sed -i '/KMI_SYMBOL_LIST_STRICT_MODE/d' common/build.config.gki.aarch64
+
+              echo "Building the kernel..."
+              if [ -f "build/build.sh" ]; then
+                LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh CC="/usr/bin/ccache clang" || exit 1
+              else
+                tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast --lto=thin //common:kernel_aarch64_dist || exit 1
+              fi
+              ccache --show-stats
             fi
-            ccache --show-stats
             
       - name: 修补 Image 文件 安卓12和安卓13(仅限sukisu)
         if: ${{ inputs.use_kpm && inputs.kernelsu_variant == 'SukiSU' && (inputs.android_version == 'android12' || inputs.android_version == 'android13') }}
@@ -636,13 +676,17 @@ jobs:
         run: |
           if [ "${{ inputs.kernel_version }}" != "6.6" ]; then
             echo "Patching Image file..."
-            cd "$CONFIG/bazel-bin/common/kernel_aarch64/"
+            if [ "${{ inputs.kernel_version }}" == "6.1" ]; then
+              cd "$CONFIG/common/out/arch/arm64/boot/"
+            else
+              cd "$CONFIG/bazel-bin/common/kernel_aarch64/"
+            fi
             curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU_patch/refs/heads/main/kpm/patch_linux" -o patch
             chmod 777 patch
             ./patch
             rm -rf Image
             mv oImage Image
-            cd ../../..
+            cd "$GITHUB_WORKSPACE"
           fi
 
       - name: 创建Bootimgs文件夹并复制镜像
@@ -667,10 +711,23 @@ jobs:
           mkdir bootimgs
 
           echo "Creating bootimgs folder and copying images..."
-          cp ./$CONFIG/bazel-bin/common/kernel_aarch64/Image ./bootimgs
-          cp ./$CONFIG/bazel-bin/common/kernel_aarch64/Image.lz4 ./bootimgs
-          cp ./$CONFIG/bazel-bin/common/kernel_aarch64/Image ./
-          cp ./$CONFIG/bazel-bin/common/kernel_aarch64/Image.lz4 ./
+          if [ "${{ inputs.kernel_version }}" == "6.1" ]; then
+            # Custom make build output path
+            cp ./$CONFIG/common/out/arch/arm64/boot/Image ./bootimgs
+            # lz4 might not exist, generate it
+            if [ -f "./$CONFIG/common/out/arch/arm64/boot/Image.lz4" ]; then
+              cp ./$CONFIG/common/out/arch/arm64/boot/Image.lz4 ./bootimgs
+            else
+              lz4 -9 -f ./bootimgs/Image ./bootimgs/Image.lz4 || true
+            fi
+            cp ./bootimgs/Image ./
+            cp ./bootimgs/Image.lz4 ./ 2>/dev/null || true
+          else
+            cp ./$CONFIG/bazel-bin/common/kernel_aarch64/Image ./bootimgs
+            cp ./$CONFIG/bazel-bin/common/kernel_aarch64/Image.lz4 ./bootimgs
+            cp ./$CONFIG/bazel-bin/common/kernel_aarch64/Image ./
+            cp ./$CONFIG/bazel-bin/common/kernel_aarch64/Image.lz4 ./
+          fi
 
           # Create gzip of the Image file
           gzip -n -k -f -9 ./Image > ./Image.gz
@@ -681,19 +738,19 @@ jobs:
           cd ./AnyKernel3
 
           # Create and upload zip for each format
-          ZIP_NAME="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-AnyKernel3.zip"
+          ZIP_NAME="SleepX-1.0-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-AnyKernel3.zip"
           echo "Creating zip file: $ZIP_NAME..."
           mv ../Image ./Image
           zip -r "../$ZIP_NAME" ./*
           rm ./Image
 
-          ZIP_NAME="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-AnyKernel3-lz4.zip"
+          ZIP_NAME="SleepX-1.0-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-AnyKernel3-lz4.zip"
           echo "Creating zip file: $ZIP_NAME..."
           mv ../Image.lz4 ./Image.lz4
           zip -r "../$ZIP_NAME" ./*
           rm ./Image.lz4
 
-          ZIP_NAME="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-AnyKernel3-gz.zip"
+          ZIP_NAME="SleepX-1.0-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-AnyKernel3-gz.zip"
           echo "Creating zip file: $ZIP_NAME..."
           mv ../Image.gz ./Image.gz
           zip -r "../$ZIP_NAME" ./*
@@ -775,7 +832,7 @@ jobs:
       - name: 上传编译资产
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.kernelsu_variant }}_kernel-${{ env.CONFIG }}
+          name: SleepX-1.0_${{ inputs.kernelsu_variant }}-${{ env.CONFIG }}
           path: |
             *AnyKernel3.zip
             *.img
