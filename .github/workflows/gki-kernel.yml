@@ -164,7 +164,7 @@ jobs:
           echo "Using branch for SUSFS: $SUSFS_BRANCH"
 
           # Clone repositories using the branch names
-          git clone https://github.com/sleep-bugy/AnyKernel3-SleepX.git -b main AnyKernel3
+          git clone https://${{ secrets.GH_PAT }}@github.com/sleep-bugy/AnyKernel3-SleepX.git -b main AnyKernel3
           git clone https://github.com/ShirkNeko/susfs4ksu.git -b "$SUSFS_BRANCH"
           git clone https://github.com/Tools-cx-app/kernel_patches.git
           # Sukisu的补丁仓库
@@ -189,7 +189,7 @@ jobs:
           if [ "${{ inputs.kernel_version }}" == "6.1" ]; then
             # Use custom kernel source for 6.1
             echo "Using custom kernel source for 6.1..."
-            git clone https://github.com/sleep-bugy/kernel_sleepx_sm8635.git -b GoogleLTS-6.1.166 --depth 1 common
+            git clone https://${{ secrets.GH_PAT }}@github.com/sleep-bugy/kernel_sleepx_sm8635.git -b GoogleLTS-6.1.166 --depth 1 common
             echo "REMOTE_BRANCH=custom-GoogleLTS-6.1.166" >> $GITHUB_ENV
           else
             # Initialize and sync kernel source via AOSP manifest
